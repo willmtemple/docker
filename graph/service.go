@@ -7,6 +7,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/pkg/parsers"
 )
 
 func (s *TagStore) LookupRaw(name string) ([]byte, error) {
@@ -31,19 +32,21 @@ func (s *TagStore) Lookup(name string) (*types.ImageInspect, error) {
 	}
 
 	imageInspect := &types.ImageInspect{
-		Id:              image.ID,
-		Parent:          image.Parent,
-		Comment:         image.Comment,
-		Created:         image.Created,
-		Container:       image.Container,
-		ContainerConfig: &image.ContainerConfig,
-		DockerVersion:   image.DockerVersion,
-		Author:          image.Author,
-		Config:          image.Config,
-		Architecture:    image.Architecture,
-		Os:              image.OS,
-		Size:            image.Size,
-		VirtualSize:     s.graph.GetParentsSize(image, 0) + image.Size,
+		types.ImageInspectBase{
+			Id:              image.ID,
+			Parent:          image.Parent,
+			Comment:         image.Comment,
+			Created:         image.Created,
+			Container:       image.Container,
+			ContainerConfig: &image.ContainerConfig,
+			DockerVersion:   image.DockerVersion,
+			Author:          image.Author,
+			Config:          image.Config,
+			Architecture:    image.Architecture,
+			Os:              image.OS,
+			Size:            image.Size,
+		},
+		VirtualSize: s.graph.GetParentsSize(image, 0) + image.Size,
 	}
 
 	imageInspect.GraphDriver.Name = s.graph.driver.String()
@@ -54,6 +57,55 @@ func (s *TagStore) Lookup(name string) (*types.ImageInspect, error) {
 	}
 	imageInspect.GraphDriver.Data = graphDriverData
 	return imageInspect, nil
+}
+
+// Lookup an image located on a remote repository.
+func (s *TagStore) LookupRemote(name string) (*types.ImageInspect, error) {
+	var sf = streamformatter.NewJSONStreamFormatter()
+
+	taglessRemote, tag = parsers.ParseRepositoryTag(name)
+	if tag == "" {
+		tag = tags.DEFAULTTAG
+	}
+
+	// Resolve the Repository name from fqn to RepositoryInfo
+	repoInfo, err := s.registryService.ResolveRepository(taglessRemote)
+	if err != nil {
+		return err
+	}
+
+	// makes sure name is not empty or `scratch`
+	if err := validateRepoName(repoInfo.LocalName); err != nil {
+		return err
+	}
+
+	endpoints, err := s.registryService.LookupEndpoints(repoInfo.CanonicalName)
+	if err != nil {
+		return err
+	}
+
+	logName := repoInfo.LocalName
+	if tag != "" {
+		logName = utils.ImageReference(logName, tag)
+	}
+
+	var lastErr error
+
+	for _, endpoint := range endpoints {
+		logrus.Debugf("Trying to pull metadata of %s from %s %s", repoInfo.LocalName, endpoint.URL, endpoint.Version)
+		puller, err := NewPuller(s, endpoint, repoInfo, imagePullConfig)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		result, err = puller.GetImageData()
+
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no endpoints found for %s", image)
+		}
+		return lastErr
+	}
 }
 
 // ImageTarLayer return the tarLayer of the image
